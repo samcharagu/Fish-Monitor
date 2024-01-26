@@ -1,0 +1,221 @@
+#include <Arduino.h>
+#include <config.h>
+#include <ds3231.h>
+#include "DFRobot_PH.h"
+#include <EEPROM.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <Servo.h>
+
+struct ts t;
+const int lowtemp = 15; // lower threshold of temperature
+const int highph = 8.5; // higher threshold of pH
+const int lowph = 6.5; // lower threshold of pH
+const int lowDO = 5.0; // lower threshold of Dissolved Oxygen
+const int SENSOR_PIN = 2; // Arduino pin connected to DS18B20 sensor's DQ pin
+const int RELAY_PIN = 3;  // the Arduino pin, which connects to the IN pin of relay
+const int kPinSpeaker = 9; // Arduino pin connected to piezo buzzer
+
+OneWire oneWire(SENSOR_PIN);         // setup a oneWire instance
+DallasTemperature tempSensor(&oneWire); // pass oneWire to DallasTemperature library
+
+float temperature;    // temperature in Celsius
+int alert = 0; // state used to set the alarm
+
+#define PH_PIN A2
+float voltage,phValue;
+DFRobot_PH ph;
+
+#define DO_PIN A1
+float DOvalue;
+#define VREF 5000    //VREF (mv)
+#define ADC_RES 1024 //ADC Resolution
+
+//Single-point calibration Mode=0
+//Two-point calibration Mode=1
+#define TWO_POINT_CALIBRATION 0
+
+#define READ_TEMP (24.69) //Current water temperature ℃, Or temperature sensor function
+
+//Single point calibration needs to be filled CAL1_V and CAL1_T
+#define CAL1_V (1489) //mv
+#define CAL1_T (25)   //℃
+//Two-point calibration needs to be filled CAL2_V and CAL2_T
+//CAL1 High temperature point, CAL2 Low temperature point
+#define CAL2_V (1300) //mv
+#define CAL2_T (15)   //℃
+
+const uint16_t DO_Table[41] = {
+    14460, 14220, 13820, 13440, 13090, 12740, 12420, 12110, 11810, 11530,
+    11260, 11010, 10770, 10530, 10300, 10080, 9860, 9660, 9460, 9270,
+    9080, 8900, 8730, 8570, 8410, 8250, 8110, 7960, 7820, 7690,
+    7560, 7430, 7300, 7180, 7070, 6950, 6840, 6730, 6630, 6530, 6410};
+
+uint8_t Temperaturet;
+uint16_t ADC_Raw;
+uint16_t ADC_Voltage;
+uint16_t DO;
+
+int16_t readDO(uint32_t voltage_mv, uint8_t temperature_c)
+{
+#if TWO_POINT_CALIBRATION == 0
+  uint16_t V_saturation = (uint32_t)CAL1_V + (uint32_t)35 * temperature_c - (uint32_t)CAL1_T * 35;
+  return (voltage_mv * DO_Table[temperature_c] / V_saturation);
+#else
+  uint16_t V_saturation = (int16_t)((int8_t)temperature_c - CAL2_T) * ((uint16_t)CAL1_V - CAL2_V) / ((uint8_t)CAL1_T - CAL2_T) + CAL2_V;
+  return (voltage_mv * DO_Table[temperature_c] / V_saturation);
+#endif
+}
+
+double Vout = 0;  // Variables for Measured Voltage and Calculated Current
+double Current = 0;
+const double scale_factor = 0.185; // Constants for Scale Factor 5A
+const double vRef = 5.00; // Constants for A/D converter resolution
+const double resConvert = 1024; // Arduino has 10-bit ADC, so 1024 possible values
+double resADC = vRef/resConvert;  // Reference voltage is 5V if not using AREF external reference
+double zeroPoint = vRef/2;  // Zero point is half of Reference Voltage
+
+Servo myservo;  // create servo object to control a servo
+int pos = 0;    // variable to store the servo position
+
+void setup() {
+  //setup code to run once:
+  Serial.begin(9600);
+  tempSensor.begin();    // initialize the sensor
+  pinMode(kPinSpeaker, OUTPUT);//declare piezo pin as output
+  pinMode(RELAY_PIN, OUTPUT);//declare ralay pin as output
+  Wire.begin(); //Initialise the RTC
+  DS3231_init(DS3231_CONTROL_INTCN);
+  myservo.attach(10);  // attaches the servo on pin 10 to the servo object
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+  rtc();
+  readTemperature();
+  readpH();
+  DOsensor();                          
+
+  if(t.sec>30)
+    {servo();}
+
+  else if(temperature < lowtemp){
+    solenoidvalve();currentsensor();
+     if(Current < 0.20){
+    alarm();alert = 1;
+  }else alert = 0;
+  }
+  else if(phValue > highph){
+    solenoidvalve();currentsensor();
+     if(Current < 0.20){
+    alarm();alert = 1;
+  }else alert = 0;
+  } 
+  else if(phValue < lowph){
+    solenoidvalve();currentsensor();
+     if(Current < 0.20){
+    alarm();alert = 1;
+  }else alert = 0;
+  }
+  /*if (DOvalue < lowDO){
+    solenoidvalve();currentsensor();
+     if(Current < 0.20){
+    alarm();alert = 1;
+  }else alert = 0;
+  }*/
+}
+float readTemperature()
+{
+  tempSensor.requestTemperatures();             // send the command to get temperatures
+  temperature = tempSensor.getTempCByIndex(0);  // read temperature in Celsius
+  Serial.print("Temperature = ");
+  Serial.print(temperature,1);
+  Serial.print("°C");
+ }
+
+float readpH()
+{
+    static unsigned long timepoint = millis();
+    if(millis()-timepoint>1000U){                  //time interval: 1s
+        timepoint = millis();         
+        voltage = analogRead(PH_PIN)/1024.0*5000;  // read the voltage
+        phValue = ph.readPH(voltage,temperature);  // convert voltage to pH with temperature compensation
+        Serial.print("  at a pH = ");
+        Serial.println(phValue,2);
+        
+ }
+}
+float alarm()
+{
+ Serial.print("Alarm ON\t");
+ digitalWrite(kPinSpeaker, HIGH);delay(500);
+ digitalWrite(kPinSpeaker, LOW);delay(500);
+ digitalWrite(kPinSpeaker, HIGH);delay(500);
+ digitalWrite(kPinSpeaker, LOW);delay(500);
+}
+float solenoidvalve()
+{
+  digitalWrite(RELAY_PIN, HIGH);
+  delay(5000);
+  digitalWrite(RELAY_PIN, LOW);
+  delay(5000);
+  }
+float currentsensor()
+{
+  // Vout is read 1000 Times for precision
+  for(int i = 0; i < 1000; i++) {
+    Vout = (Vout + (resADC * analogRead(A0)));   
+    delay(1);}
+    // Get Vout in mv
+  Vout = Vout /1000;
+  // Convert Vout into Current using Scale Factor
+  Current = (Vout - zeroPoint)/ scale_factor;
+  Serial.print("Current through solenoid valve = ");                  
+  Serial.print(Current,4);
+  Serial.println(" Amps");
+  }
+  
+float rtc()
+  {
+    DS3231_get(&t);
+  Serial.print("\nDate : ");
+  Serial.print(t.mday);
+  Serial.print("/");
+  Serial.print(t.mon);
+  Serial.print("/");
+  Serial.print(t.year);
+  Serial.print("\t Hour : ");
+  Serial.print(t.hour);
+  Serial.print(":");
+  Serial.print(t.min);
+  Serial.print(".");
+  Serial.println(t.sec);
+    }
+  float servo()
+  {
+  Serial.print("Servo ON\n");
+  for (pos = 0; pos <= 180; pos += 1) { // goes from 0 degrees to 180 degrees
+    // in steps of 1 degree
+    myservo.write(pos);              // tell servo to go to position in variable 'pos'
+    delay(15);                       // waits 15 ms for the servo to reach the position
+  }
+  delay(5000);
+  for (pos = 180; pos >= 0; pos -= 1) { // goes from 180 degrees to 0 degrees
+    myservo.write(pos);              // tell servo to go to position in variable 'pos'
+    delay(15);                       // waits 15 ms for the servo to reach the position
+  }
+  }
+
+  float DOsensor()
+  {
+     // Temperaturet = (uint8_t)READ_TEMP;
+  ADC_Raw = analogRead(DO_PIN);
+  ADC_Voltage = uint32_t(VREF) * ADC_Raw / ADC_RES;
+
+  //Serial.print("Temperaturet:\t" + String(Temperaturet) + "\t");
+  //Serial.print("ADC RAW:\t" + String(ADC_Raw) + "\t");
+ // Serial.print("ADC Voltage:\t" + String(ADC_Voltage) + "\t");
+  Serial.println("Dissolved Oxygen = " + String(readDO(ADC_Voltage, Temperaturet)) + " ug/L");
+  //DOvalue = DO;Serial.print("\t" + DO);
+    }
